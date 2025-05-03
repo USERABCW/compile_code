@@ -1,0 +1,199 @@
+#!/bin/bash
+
+# 参数检查
+if [ $# -lt 2 ]; then
+  echo -e "\nUsage: compile.sh \$VERSION [e.g., v5.10] \$ARCH [e.g., i386, x86_64] [REPEAT_TIMES (default 1)]\n"
+  exit 1
+fi
+
+HOME="/home/user"
+VERSION=$1
+ARCH=$2
+REPEAT=${3:-1}  # 新增：第三个参数为重复次数，默认为1次
+
+ROOT="${HOME}/Kernel"
+GIT="${ROOT}/git"
+LINUX="${ROOT}/${VERSION}/${ARCH}"
+MODULE_INSTALL_PATH="${LINUX}/modules"
+
+# 32位架构编译标志
+if [ "${ARCH}" == "i386" ]; then
+  export CFLAGS="-m32"
+  export LDFLAGS="-m32"
+fi
+
+# 清理旧编译产物
+clean_old_build() {
+  echo "[*] 清理旧编译文件..."
+  make mrproper > /dev/null 2>&1
+  rm -f .config .config.old
+}
+
+# 创建构建目录并同步代码
+if [ ! -d "${LINUX}" ]; then
+  mkdir -p "${LINUX}"
+  (
+    cd "${GIT}" || exit 1
+    git checkout master && git pull
+    git checkout "${VERSION}" || { echo "[X] 无效的版本标签"; exit 1; }
+    cp -a "${GIT}/." "${LINUX}/"
+  ) || exit 1
+fi
+
+cd "${LINUX}" || exit 1
+
+# 强制清理
+clean_old_build
+
+# 配置生成
+if [ ! -f .config ]; then
+  make ARCH="${ARCH}" "${ARCH}_defconfig" || { echo "[X] Defconfig 生成失败"; exit 1; }
+
+  declare -a config_enable=(
+    CONFIG_CONFIGFS_FS
+    CONFIG_CONFIGFS_FS_USER
+    CONFIG_SECURITYFS
+    CONFIG_UEVENT_HELPER
+    CONFIG_NET_9P
+    CONFIG_VIRTIO_PCI
+    CONFIG_NET_9P_VIRTIO
+    CONFIG_9P_FS
+    CONFIG_9P_FS_POSIX_ACL
+    CONFIG_DEVTMPFS
+    CONFIG_DEVTMPFS_MOUNT
+    CONFIG_FUSE_FS
+    CONFIG_CUSE
+    CONFIG_SYSVIPC
+    CONFIG_SYSVIPC_SYSCTL
+    CONFIG_KALLSYMS_ALL
+    CONFIG_DEBUG_KERNEL
+    CONFIG_NAMESPACES
+    CONFIG_USER_NS
+    CONFIG_HOTPLUG_PCI_PCIE
+    CONFIG_HOTPLUG_PCI
+    CONFIG_HOTPLUG
+    CONFIG_KGDB
+    CONFIG_DEBUG_INFO_DWARF4
+    CONFIG_GDB_SCRIPTS
+    CONFIG_SLUB_DEBUG
+    CONFIG_DEBUG_KMEMLEAK
+    CONFIG_X86_X2APIC
+    CONFIG_X86_PTDUMP
+    CONFIG_MODULES
+    CONFIG_MODULE_UNLOAD
+    CONFIG_TTY
+    CONFIG_AX25
+    CONFIG_HAMRADIO
+    CONFIG_6PACK
+    CONFIG_PPP
+    CONFIG_PPP_ASYNC
+    CONFIG_PPP_DEFLATE
+    CONFIG_PPP_MPPE
+    CONFIG_ZLIB
+    CONFIG_ZLIB_DEFLATE
+    CONFIG_CRYPTO
+    CONFIG_CRYPTO_SHA1
+    CONFIG_CRYPTO_ARC4
+    CONFIG_E1000
+    CONFIG_E1000E
+    CONFIG_CGROUP_NS
+    CONFIG_DEVPTS_MULTIPLE_INSTANCES
+    CONFIG_UNIX98_PTYS
+    CONFIG_IKCONFIG
+    CONFIG_IKCONFIG_PROC
+    CONFIG_GCC_PLUGINS
+    CONFIG_GCC_PLUGIN_RANDSTRUCT
+    #CONFIG_CC_HAS_RANDSTRUCT
+    CONFIG_GCC_PLUGIN_RANDSTRUCT_FULL
+  )
+
+  for config in "${config_enable[@]}"; do
+    ./scripts/config --enable "$config" || { echo "[X] 配置 $config 失败"; exit 1; }
+  done
+
+  ./scripts/config --disable CONFIG_MKISS
+  ./scripts/config --disable CONFIG_MODULE_SIG
+
+  make ARCH="${ARCH}" savedefconfig
+  cp defconfig .config
+  make ARCH="${ARCH}" olddefconfig
+
+  echo "[*] 配置状态检查："
+  grep -E "CONFIG_TTY|CONFIG_AX25|CONFIG_6PACK" .config || {
+    echo "[X] 关键配置未启用！";
+    exit 1;
+  }
+fi
+
+echo "[*] 验证 RANDSTRUCT 配置状态："
+grep -E "CONFIG_GCC_PLUGIN_RANDSTRUCT=y|CONFIG_GCC_PLUGINS=y" .config || {
+  echo "[X] RANDSTRUCT 配置未启用！";
+  exit 1;
+}
+
+# 选择合适的 GCC 版本
+case "$VERSION" in
+  v5.*)  COMPILER_VER=10 ;;
+  v6.*)  COMPILER_VER=12 ;;
+  *)     echo "Unsupported version"; exit 1 ;;
+esac
+
+# 检查 GCC 版本
+if ! command -v "gcc-${COMPILER_VER}" &> /dev/null; then
+  echo "[X] 找不到 gcc-${COMPILER_VER}, 请执行: sudo apt install gcc-${COMPILER_VER}"
+  exit 1
+fi
+
+export CC="gcc-${COMPILER_VER}"
+export CXX="g++-${COMPILER_VER}"
+export HOSTCC="gcc-${COMPILER_VER}"
+
+# 新增：统计REPEAT次编译时间
+cpu_cores=$(nproc)
+total_time=0
+declare -a build_times=()
+
+for ((i=1; i<=REPEAT; i++)); do
+  echo "[*] 第 ${i}/${REPEAT} 次编译开始..."
+
+  start_time=$(date +%s)
+
+  # 清理旧产物保持每次干净
+  make mrproper > /dev/null 2>&1
+  cp .config .config.bak
+  cp .config.bak .config
+  make ARCH="${ARCH}" olddefconfig > /dev/null
+
+  make -j"${cpu_cores}" ARCH="${ARCH}" CC="${CC}" CXX="${CXX}" HOSTCC="${HOSTCC}" > "build_${i}.log" 2>&1 || {
+    echo "[X] 第 $i 次编译失败！查看 build_${i}.log";
+    exit 1;
+  }
+
+  end_time=$(date +%s)
+  elapsed_time=$((end_time - start_time))
+  build_times+=($elapsed_time)
+  total_time=$((total_time + elapsed_time))
+
+  echo "[√] 第 $i 次编译完成！耗时: $((elapsed_time / 60)) 分钟 $((elapsed_time % 60)) 秒"
+  echo
+done
+
+# 打印每次编译耗时
+echo "[*] 每次编译耗时统计："
+for i in "${!build_times[@]}"; do
+  time="${build_times[$i]}"
+  echo "第 $((i+1)) 次: $((time / 60)) 分钟 $((time % 60)) 秒"
+done
+
+# 计算平均时间
+average_time=$((total_time / REPEAT))
+echo
+echo "[*] 平均编译耗时（${REPEAT}次取平均）：$((average_time / 60)) 分钟 $((average_time % 60)) 秒"
+
+# 最终验证
+echo "[*] 关键配置验证："
+grep -E "CONFIG_6PACK=y|CONFIG_AX25=y" .config || {
+  echo "[X] 6PACK或AX25未启用！";
+  exit 1;
+}
+
